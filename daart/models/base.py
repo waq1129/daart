@@ -5,10 +5,12 @@ import numpy as np
 import os
 import pickle
 from scipy.special import softmax as scipy_softmax
+from scipy.special import expit as scipy_sigmoid
 from scipy.stats import entropy
 import torch
 from sklearn.metrics import accuracy_score
 from torch import nn, optim, save, Tensor
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from daart.io import export_hparams
@@ -268,7 +270,7 @@ class BaseModel(nn.Module):
             self.save(os.path.join(save_path, 'last_model.pt'))
 
         # load weights of best model if not current
-        if best_model_saved:
+        if 0:#best_model_saved:
             self.load_state_dict(torch.load(
                 os.path.join(save_path, 'best_val_model.pt'),
                 map_location=lambda storage, loc: storage))
@@ -324,7 +326,8 @@ class Segmenter(BaseModel):
         self.build_model()
 
         # label loss based on cross entropy; don't compute gradient when target = 0
-        self.class_loss = nn.CrossEntropyLoss(ignore_index=0, reduction='mean')
+        self.class_loss = nn.CrossEntropyLoss(reduction='mean')#(ignore_index=0, reduction='mean')
+        self.class_loss_bin = nn.BCEWithLogitsLoss(reduction='mean')
         self.pred_loss = nn.MSELoss(reduction='mean')
 
     def __str__(self):
@@ -333,6 +336,9 @@ class Segmenter(BaseModel):
 
     def build_model(self):
         """Construct the model using hparams."""
+
+        torch.manual_seed(self.hparams['rng_seed_model'])
+        np.random.seed(self.hparams['rng_seed_model'])
 
         if self.hparams['model_type'].lower() == 'temporal-mlp':
             from daart.models.temporalmlp import TemporalMLP
@@ -380,7 +386,9 @@ class Segmenter(BaseModel):
         self.eval()
 
         softmax = nn.Softmax(dim=1)
-
+        sigmoid = nn.Sigmoid()
+        lambda_bin = self.hparams.get('lambda_bin', 0)
+        
         # initialize container for labels
         labels = [[] for _ in range(data_generator.n_datasets)]
         scores = [[] for _ in range(data_generator.n_datasets)]
@@ -400,8 +408,12 @@ class Segmenter(BaseModel):
                 # targets = data['labels'][0]
                 outputs_dict = self.model(predictors)
                 # push through log-softmax, since this is included in the loss and not model
-                labels[sess][data['batch_idx'].item()] = \
-                    softmax(outputs_dict['labels']).cpu().detach().numpy()
+                if lambda_bin:
+                    labels[sess][data['batch_idx'].item()] = \
+                        sigmoid(outputs_dict['labels']).cpu().detach().numpy()  
+                else:
+                    labels[sess][data['batch_idx'].item()] = \
+                        softmax(outputs_dict['labels']).cpu().detach().numpy()
                 embedding[sess][data['batch_idx'].item()] = \
                     outputs_dict['embedding'].cpu().detach().numpy()
                 if return_scores:
@@ -436,6 +448,8 @@ class Segmenter(BaseModel):
         lambda_weak = self.hparams.get('lambda_weak', 0)
         lambda_strong = self.hparams.get('lambda_strong', 0)
         lambda_pred = self.hparams.get('lambda_pred', 0)
+        lambda_decode = self.hparams.get('lambda_decode', 0)
+        lambda_bin = self.hparams.get('lambda_bin', 0)
 
         # push data through model
         markers = data['markers'][0]
@@ -444,8 +458,14 @@ class Segmenter(BaseModel):
         # get masks that define where strong labels are
         if lambda_strong > 0:
             labels_strong = data['labels_strong'][0]
+            if lambda_bin:
+                labels_strong_oh = F.one_hot(labels_strong, num_classes=self.hparams.get('output_size', 0))
+                labels_strong_oh = labels_strong_oh.type(torch.FloatTensor).cuda()
+            else:
+                labels_strong_oh = None
         else:
             labels_strong = None
+            labels_strong_oh = None
 
         # initialize loss to zero
         loss = 0
@@ -474,12 +494,26 @@ class Segmenter(BaseModel):
         # compute loss on strong labels
         # ------------------------------------
         if lambda_strong > 0:
-            loss_strong = self.class_loss(outputs_dict['labels'], labels_strong)
+            if lambda_bin:
+                loss_strong = self.class_loss_bin(outputs_dict['labels'], labels_strong_oh)
+            else:
+                loss_strong = self.class_loss(outputs_dict['labels'], labels_strong)
+            
             loss += lambda_strong * loss_strong
             loss_strong_val = loss_strong.item()
         else:
             loss_strong_val = 0
-
+            
+        # ------------------------------------
+        # compute loss on reconstruction
+        # ------------------------------------
+        if lambda_decode > 0:
+            loss_decode = self.pred_loss(markers, outputs_dict['prediction'])
+            loss += lambda_decode * loss_decode
+            loss_decode_val = loss_decode.item()
+        else:
+            loss_decode_val = 0
+            
         # ------------------------------------
         # compute loss on one-step predictions
         # ------------------------------------
@@ -498,6 +532,7 @@ class Segmenter(BaseModel):
             'loss': loss.item(),
             'loss_weak': loss_weak_val,
             'loss_strong': loss_strong_val,
+            'loss_decode': loss_decode_val,
             'loss_pred': loss_pred_val,
             'fc': fc,
         }
@@ -512,7 +547,7 @@ class Ensembler(object):
         self.models = models
         self.n_models = len(models)
 
-    def predict_labels(self, data_generator, combine_before_softmax=False, weights=None):
+    def predict_labels(self, data_generator, combine_before_softmax=False, weights=None, lambda_bin=False):
         """Combine class predictions from multiple models by averaging before softmax.
 
         Parameters
@@ -549,7 +584,10 @@ class Ensembler(object):
                     if combine_before_softmax:
                         labels_curr.append(labels_tmp[None, ...])
                     else:
-                        labels_curr.append(scipy_softmax(labels_tmp, axis=1)[None, ...])
+                        if lambda_bin:
+                            labels_curr.append(scipy_sigmoid(labels_tmp, axis=1)[None, ...])
+                        else:
+                            labels_curr.append(scipy_softmax(labels_tmp, axis=1)[None, ...])
 
                 # combine predictions across models
                 if weights is None:
@@ -572,8 +610,12 @@ class Ensembler(object):
 
                 # store predictions
                 if combine_before_softmax:
-                    # push through softmax
-                    labels[sess][data['batch_idx'].item()] = scipy_softmax(labels_curr, axis=1)
+                    if lambda_bin:
+                        # push through softmax
+                        labels[sess][data['batch_idx'].item()] = scipy_sigmoid(labels_curr, axis=1)
+                    else:
+                        # push through softmax
+                        labels[sess][data['batch_idx'].item()] = scipy_softmax(labels_curr, axis=1)
                 else:
                     labels[sess][data['batch_idx'].item()] = labels_curr
 

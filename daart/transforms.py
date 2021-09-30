@@ -222,7 +222,7 @@ class ZScore(Transform):
 
         """
         sample -= np.mean(sample, axis=0)
-        sample /= np.std(sample, axis=0)
+        sample /= (np.std(sample, axis=0)+1e-5)
         return sample
 
     def __repr__(self):

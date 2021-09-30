@@ -21,6 +21,11 @@ class TCN(BaseModel):
         self.predictor = None
         self.build_model()
 
+        if 'latent_size' in self.hparams.keys():
+            self.latent_size = self.hparams['latent_size']
+        else:
+            self.latent_size = self.hparams['n_hid_units']
+        
     def __str__(self):
         """Pretty print model architecture."""
         format_str = '\nTCN architecture\n'
@@ -52,7 +57,7 @@ class TCN(BaseModel):
         out_size = self.hparams['n_hid_units']
 
         t_sizes = [self.hparams['batch_size']]
-        for i_layer in range(self.hparams['n_hid_layers']):
+        for i_layer in range(self.hparams['n_hid_layers']-1):
 
             # conv -> activation -> maxpool
             self._build_tcn_encoder_block(
@@ -66,13 +71,22 @@ class TCN(BaseModel):
             # update layer info
             global_layer_num += 1
 
+        # latent layer    
+        # conv -> activation -> maxpool
+        self._build_tcn_encoder_block(
+            module_list=self.encoder, input_size=in_size, output_size=self.latent_size,
+            global_layer_num=global_layer_num, t_sizes=t_sizes)
+        
+        # update layer info
+        global_layer_num += 1
+
         # ----------------------------
         # Classifier
         # ----------------------------
 
         self.classifier = nn.ModuleList()
 
-        in_size = self.hparams['n_hid_units']
+        in_size = self.latent_size#self.hparams['n_hid_units']
         out_size = self.hparams['n_hid_units']
 
         for i_layer in range(self.hparams['n_hid_layers']):
@@ -106,7 +120,7 @@ class TCN(BaseModel):
 
             self.predictor = nn.ModuleList()
 
-            in_size = self.hparams['n_hid_units']
+            in_size = self.latent_size#self.hparams['n_hid_units']
             out_size = self.hparams['n_hid_units']
 
             for i_layer in range(self.hparams['n_hid_layers']):
@@ -294,10 +308,14 @@ class DilatedTCN(BaseModel):
         self.hparams = hparams
         self.hparams['pred_final_linear_layer'] = self.hparams.get('pred_final_linear_layer', True)
 
+        if 'latent_size' in self.hparams.keys():
+            self.latent_size = self.hparams['latent_size']
+        else:
+            self.latent_size = self.hparams['n_hid_units']
+        
         self.encoder = None
         self.classifier = None
         self.predictor = None
-        self.decoder = None
         self.build_model()
 
     def __str__(self):
@@ -314,11 +332,6 @@ class DilatedTCN(BaseModel):
             format_str += 'Predictor:\n'
             for i, module in enumerate(self.predictor):
                 format_str += str('    {}: {}\n'.format(i, module))
-        format_str += '\n'
-        if self.decoder is not None:
-            format_str += 'Decoder:\n'
-            for i, module in enumerate(self.decoder):
-                format_str += str('    {}: {}\n'.format(i, module))
         return format_str
 
     def build_model(self):
@@ -332,10 +345,6 @@ class DilatedTCN(BaseModel):
         # linear classifier
         self._build_classifier(global_layer_num=global_layer_num)
 
-        # decoder TCN
-        if self.hparams.get('lambda_decode', 0) > 0:
-            self._build_decoder(global_layer_num=global_layer_num)
-            
         # predictor TCN
         if self.hparams.get('lambda_pred', 0) > 0:
             self._build_predictor(global_layer_num=global_layer_num)
@@ -344,7 +353,7 @@ class DilatedTCN(BaseModel):
 
         self.encoder = nn.Sequential()
 
-        for i_layer in range(self.hparams['n_hid_layers']):
+        for i_layer in range(self.hparams['n_hid_layers']-1):
 
             dilation = 2 ** i_layer
             in_size = self.hparams['input_size'] if i_layer == 0 else self.hparams['n_hid_units']
@@ -360,6 +369,23 @@ class DilatedTCN(BaseModel):
 
             # update layer info
             global_layer_num += 1
+            
+        # latent layer
+        i_layer = self.hparams['n_hid_layers']-1
+        dilation = 2 ** i_layer
+        in_size = self.hparams['input_size'] if i_layer == 0 else self.hparams['n_hid_units']
+        out_size = self.latent_size
+
+        # conv -> activation -> dropout (+ residual)
+        tcn_block = DilationBlock(
+            input_size=in_size, int_size=out_size, output_size=out_size,
+            kernel_size=self.hparams['n_lags'], stride=1, dilation=dilation,
+            activation=self.hparams['activation'], dropout=self.hparams.get('dropout', 0.2))
+        name = 'tcn_block_%02i' % global_layer_num
+        self.encoder.add_module(name, tcn_block)
+
+        # update layer info
+        global_layer_num += 1
 
         return global_layer_num
 
@@ -367,7 +393,7 @@ class DilatedTCN(BaseModel):
 
         self.classifier = nn.Sequential()
 
-        in_size = self.hparams['n_hid_units']
+        in_size = self.latent_size#self.hparams['n_hid_units']
         out_size = self.hparams['output_size']
 
         # add layer (cross entropy loss handles activation)
@@ -382,7 +408,9 @@ class DilatedTCN(BaseModel):
         for i_layer in range(self.hparams['n_hid_layers']):
 
             dilation = 2 ** (self.hparams['n_hid_layers'] - i_layer - 1)  # down by powers of 2
-            in_size = self.hparams['n_hid_units']
+            
+            in_size = self.latent_size if i_layer == 0 else self.hparams['n_hid_units']
+            
             if i_layer == (self.hparams['n_hid_layers'] - 1):
                 # final layer
                 # out_size = self.hparams['input_size']
@@ -416,50 +444,6 @@ class DilatedTCN(BaseModel):
                 out_channels=self.hparams['input_size'],
                 kernel_size=1)  # kernel_size=1 <=> dense, fully connected layer
             self.predictor.add_module('final_dense_%02i' % global_layer_num, dense)
-
-        return global_layer_num
-    
-    def _build_decoder(self, global_layer_num):
-
-        self.decoder = nn.Sequential()
-
-        for i_layer in range(self.hparams['n_hid_layers']):
-
-            dilation = 2 ** (self.hparams['n_hid_layers'] - i_layer - 1)  # down by powers of 2
-            in_size = self.hparams['n_hid_units']
-            if i_layer == (self.hparams['n_hid_layers'] - 1):
-                # final layer
-                # out_size = self.hparams['input_size']
-                # final_activation = 'linear'
-                # decoder_block = True
-                out_size = self.hparams['n_hid_units']
-                final_activation = self.hparams['activation']
-                decoder_block = False
-            else:
-                # intermediate layer
-                out_size = self.hparams['n_hid_units']
-                final_activation = self.hparams['activation']
-                decoder_block = False
-
-            # conv -> activation -> dropout (+ residual)
-            tcn_block = DilationBlock(
-                input_size=in_size, int_size=in_size, output_size=out_size,
-                kernel_size=self.hparams['n_lags'], stride=1, dilation=dilation,
-                activation=self.hparams['activation'], final_activation=final_activation,
-                dropout=self.hparams.get('dropout', 0.2), predictor_block=decoder_block)
-            name = 'tcn_block_%02i' % global_layer_num
-            self.decoder.add_module(name, tcn_block)
-
-            # update layer info
-            global_layer_num += 1
-
-        # add final fully-connected layer
-        if self.hparams['pred_final_linear_layer']:
-            dense = nn.Conv1d(
-                in_channels=out_size,
-                out_channels=self.hparams['input_size'],
-                kernel_size=1)  # kernel_size=1 <=> dense, fully connected layer
-            self.decoder.add_module('final_dense_%02i' % global_layer_num, dense)
 
         return global_layer_num
 
@@ -497,14 +481,8 @@ class DilatedTCN(BaseModel):
             y = self.predictor(x).squeeze().transpose(1, 0)
         else:
             y = None
-            
-        # push embedding through predictor network to get data at subsequent time points
-        if self.hparams.get('lambda_decode', 0) > 0:
-            y_hat = self.decoder(x).squeeze().transpose(1, 0)
-        else:
-            y_hat = None
 
-        return {'labels': z, 'prediction': y, 'decoding': y_hat, 'embedding': x.squeeze().transpose(1, 0)}
+        return {'labels': z, 'prediction': y, 'embedding': x.squeeze().transpose(1, 0)}
 
 
 class DilationBlock(nn.Module):

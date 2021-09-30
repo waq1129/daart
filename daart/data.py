@@ -253,13 +253,21 @@ class SingleDataset(data.Dataset):
 
                 if file_ext == 'csv':
                     # assume dlc/dgp format
-                    from numpy import genfromtxt
-                    dlc = genfromtxt(
-                        self.paths[signal], delimiter=',', dtype=None, encoding=None)
-                    dlc = dlc[3:, 1:].astype('float')  # get rid of headers, etc.
+#                     from numpy import genfromtxt
+#                     dlc = genfromtxt(
+#                         self.paths[signal], delimiter=',', dtype=None, encoding=None)
+#                     dlc = dlc[3:, 1:].astype('float')  # get rid of headers, etc.
+#                     x = dlc[:, 0::3]
+#                     y = dlc[:, 1::3]
+#                     data_curr = np.hstack([x, y])
+                    import pandas as pd
+                    data = pd.read_csv(self.paths[signal])
+                    dlc = data.to_numpy()
+                    dlc = dlc[2:, 1:].astype('float')  # get rid of headers, etc.
                     x = dlc[:, 0::3]
                     y = dlc[:, 1::3]
                     data_curr = np.hstack([x, y])
+
                 elif file_ext == 'h5':
                     # assume dlc/dgp format
                     with h5py.File(self.paths[signal], 'r') as f:
@@ -288,11 +296,20 @@ class SingleDataset(data.Dataset):
 
             elif signal == 'labels_weak':
 
-                # assume particular pkl format
-                with open(self.paths[signal], 'rb') as f:
-                    data_curr = pickle.load(f)['states']
-                self.dtypes[signal] = 'int32'
+                file_ext = self.paths[signal].split('.')[-1]
 
+                if file_ext == 'csv':
+                    labels = np.genfromtxt(
+                    self.paths[signal], delimiter=',', dtype=np.int, encoding=None)
+                    labels = labels[1:, 1:]  # get rid of headers, etc.
+                    data_curr = np.argmax(labels, axis=1)
+                    self.dtypes[signal] = 'int32'
+                    
+                elif file_ext == 'pkl':
+                    with open(self.paths[signal], 'rb') as f:
+                        data_curr = pickle.load(f)['states']
+                    self.dtypes[signal] = 'int32'
+                
             else:
                 raise ValueError(
                     '"{}" is an invalid signal type; must choose from {}'.format(
@@ -303,7 +320,10 @@ class SingleDataset(data.Dataset):
                 data_curr = self.transforms[signal](data_curr)
 
             # compute batches of temporally contiguous data points
+            print('self.paths[signal]:', self.paths[signal])
+            print('1. data_curr:', data_curr.shape)
             data_curr = compute_batches(data_curr, batch_size)
+            print('2. data_curr:', len(data_curr))
 
             self.data[signal] = data_curr
 
@@ -373,7 +393,7 @@ class DataGenerator(object):
 
         # collect info about datasets
         self.n_datasets = len(self.datasets)
-
+        
         # get train/val/test batch indices for each dataset
         if trial_splits is None:
             trial_splits = {'train_tr': 8, 'val_tr': 1, 'test_tr': 1, 'gap_tr': 0}
@@ -384,7 +404,9 @@ class DataGenerator(object):
         else:
             pass
         self.batch_ratios = [None] * self.n_datasets
+        
         for i, dataset in enumerate(self.datasets):
+            print('len(dataset): ',len(dataset))
             dataset.batch_idxs = split_trials(len(dataset), rng_seed=rng_seed, **trial_splits)
             dataset.n_batches = {}
             for dtype in self._dtypes:
